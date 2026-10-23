@@ -1,0 +1,627 @@
+/// The Ferrofin WASM plugin contract — Tier 1b of the plugin architecture
+/// (see docs/EXTENSIONS.md).
+///
+/// STABILITY: this world is 0.x and UNSTABLE. It freezes (additive evolution
+/// only, like the vendored OpenAPI contract) once two or three real
+/// third-party plugins exist against it. Until then a minor bump may break
+/// guests; the host refuses to load a component built against a different
+/// version and names both versions in its error.
+///
+/// SECURITY MODEL: guests get no filesystem and no network. Every effect a
+/// plugin can have on the outside world goes through the `host` interface
+/// below — this file IS the reviewable attack surface.
+package ferrofin:plugin@0.5.0;
+
+/// Data types shared by both sides of the boundary.
+interface types {
+    /// Log severity, mapped 1:1 onto the host's tracing levels.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// A plugin's identity and presentation, surfaced on the `/Plugins` API.
+    record plugin-descriptor {
+        /// Stable plugin id — a UUID in canonical string form. A component
+        /// whose id does not parse as a UUID is rejected at load.
+        id: string,
+        /// Human-readable display name.
+        name: string,
+        /// Semantic version string of the plugin itself.
+        version: string,
+        /// One-line description shown in the dashboard.
+        description: string,
+    }
+
+    /// A dashboard settings page (or one of its resources) the plugin ships.
+    /// The server surfaces pages on `GET /web/ConfigurationPages` (tagged
+    /// with the plugin's id, which is how jellyfin-web finds a plugin's
+    /// Settings button) and serves the bytes at
+    /// `GET /web/ConfigurationPage?name=…`.
+    ///
+    /// TRUST NOTE: page content is HTML/JS executed in the ADMIN'S BROWSER
+    /// with the admin's session — the server-side sandbox does not apply to
+    /// it. This is Jellyfin's own settings-page model, and it is the single
+    /// strongest reason to install only plugins you trust.
+    record config-page {
+        /// The name the dashboard fetches this page by
+        /// (`?name=<this>`, case-insensitive, unique server-wide). A
+        /// resource keeps its file extension (`myplugin.js`) — the server
+        /// picks the content type from it; extensionless names serve as
+        /// HTML.
+        name: string,
+        /// The raw page/resource bytes.
+        content: list<u8>,
+        /// Whether the dashboard drawer links this page directly.
+        enable-in-main-menu: bool,
+    }
+
+    /// An HTTP request routed to the plugin's `handle-request` export from
+    /// the plugin's own URL space (`/Plugins/{id}/web/…`). The caller's
+    /// identity is resolved by the host and passed as plain fields — a
+    /// guest NEVER sees credentials or tokens.
+    ///
+    /// TRUST NOTE: this URL space is reachable WITHOUT authentication
+    /// (plugin assets are loaded via plain `<script src>` tags), so
+    /// `handle-request` is an anonymous attack surface. Check
+    /// `is-authenticated` / `is-admin` before doing anything sensitive.
+    record plugin-request {
+        /// The HTTP method (`GET`, `POST`, …).
+        method: string,
+        /// The path RELATIVE to the plugin's prefix, leading `/` included.
+        path: string,
+        /// The raw query string (`""` when absent).
+        query: string,
+        /// Request headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// The request body (the host caps it at 1 MiB).
+        body: option<list<u8>>,
+        /// The authenticated caller's user id, when there is one.
+        user-id: option<string>,
+        /// Whether the caller is an administrator (or an API key).
+        is-admin: bool,
+        /// Whether the caller presented valid credentials at all.
+        is-authenticated: bool,
+    }
+
+    /// The response to a `plugin-request`. Bodies larger than the plugin's
+    /// memory limit are refused by the host.
+    record plugin-response {
+        /// The HTTP status code.
+        status: u16,
+        /// Response headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// The response body bytes.
+        body: list<u8>,
+    }
+
+    /// A declared transformation of a served `/web` file: a literal
+    /// search/replace the host applies when serving files matching the
+    /// pattern. This is how a plugin injects its client-side hooks
+    /// (script/style tags, function wrappers) into jellyfin-web.
+    ///
+    /// TRUST NOTE: this is JavaScript injection into EVERY user's browser —
+    /// a strictly larger grant than settings pages (admin-only). It is the
+    /// single strongest reason to install only plugins you trust.
+    record web-transform {
+        /// The served-file name pattern the transform applies to
+        /// (e.g. `index.html`, `*.chunk.js`).
+        path-pattern: string,
+        /// The literal text to find (the host caps it at 256 KiB).
+        search: string,
+        /// The literal replacement text (the host caps it at 256 KiB).
+        replace: string,
+    }
+
+    /// Decoded-audio parameters for `extract-audio`. The host pins the
+    /// entire codec pipeline; a guest only chooses rate/channels, and the
+    /// host clamps the rate to 8000..=48000 and channels to 1..=2.
+    record audio-spec {
+        /// Target sample rate in Hz (clamped to 8000..=48000).
+        sample-rate: u32,
+        /// Channel count: 1 (mono) or 2 (interleaved stereo).
+        channels: u8,
+    }
+
+    /// One window of one library item's audio. The guest names a library
+    /// ITEM — never a filesystem path; the host resolves the file itself.
+    /// The window is capped at 60 seconds per call AND at a decoded size of
+    /// one quarter of the plugin's memory limit; longer analyses stream
+    /// consecutive windows (fingerprinting/loudness are streaming anyway).
+    record audio-window {
+        /// Canonical UUID string of the library item.
+        item-id: string,
+        /// Window start, in ticks (100 ns units).
+        start-ticks: s64,
+        /// Window length, in ticks (host cap: 60 s).
+        duration-ticks: s64,
+        /// Requested decode parameters.
+        spec: audio-spec,
+    }
+
+    /// Interleaved signed-16-bit PCM, exactly as requested.
+    record audio-chunk {
+        /// The spec actually decoded (after clamping).
+        spec: audio-spec,
+        /// The window start, echoed.
+        start-ticks: s64,
+        /// Interleaved samples.
+        samples: list<s16>,
+    }
+
+    /// Still-frame encodings for `extract-frames`.
+    enum frame-format {
+        /// Raw 8-bit grayscale at exactly max-dimension × max-dimension
+        /// (aspect is NOT preserved — analysis frames, not thumbnails).
+        gray8,
+        /// JPEG, scaled to fit max-dimension (aspect preserved).
+        jpeg,
+    }
+
+    /// Sampled stills from one library item. Host caps: at most 16
+    /// timestamps per call, max-dimension clamped to 320.
+    record frame-request {
+        /// Canonical UUID string of the library item.
+        item-id: string,
+        /// The instants to sample, in ticks.
+        timestamps-ticks: list<s64>,
+        /// The longest output edge, in pixels (clamped to 320).
+        max-dimension: u32,
+        /// The output encoding.
+        format: frame-format,
+    }
+
+    /// One sampled still. NOTE: `jpeg` frames carry `width`/`height` of 0
+    /// — the dimensions live inside the JPEG itself; `gray8` frames carry
+    /// their exact raw dimensions.
+    record video-frame {
+        /// The sampled instant, in ticks.
+        ticks: s64,
+        /// Output width in pixels.
+        width: u32,
+        /// Output height in pixels.
+        height: u32,
+        /// The encoding used.
+        format: frame-format,
+        /// The encoded bytes.
+        data: list<u8>,
+    }
+
+    /// The technical facts a guest needs to window an item sensibly.
+    record media-technical-info {
+        /// Total runtime in ticks (0 when unknown).
+        duration-ticks: s64,
+        /// Whether the item has at least one audio stream.
+        has-audio: bool,
+        /// Whether the item has at least one video stream.
+        has-video: bool,
+        /// The container hint (file extension), lowercased; may be empty.
+        container: string,
+    }
+
+    /// A per-user watch-state update for `set-user-data`. Unset fields are
+    /// left untouched.
+    record user-data-update {
+        /// Mark played / unplayed.
+        played: option<bool>,
+        /// Set / clear the favorite flag.
+        favorite: option<bool>,
+        /// Set the resume position, in ticks.
+        playback-position-ticks: option<s64>,
+    }
+
+    /// One remote-artwork candidate a provider offers. The HOST downloads
+    /// the winning candidate itself, through the plugin's declared egress
+    /// (a provider plugin declares its API and image-CDN hosts) — raw
+    /// image bytes never cross the guest boundary.
+    record image-candidate {
+        /// The image slot (`Primary`, `Backdrop`, `Logo`, `Thumb`, …).
+        kind: string,
+        /// The image URL (must sit inside the plugin's declared egress).
+        url: string,
+        /// Pixel width, when known.
+        width: option<u32>,
+        /// Pixel height, when known.
+        height: option<u32>,
+        /// BCP-47 language of any embedded text, when known.
+        language: option<string>,
+    }
+
+    /// A named metadata provider's identity: how the plugin appears in
+    /// the library-options provider lists (Dashboard → Libraries).
+    record provider-descriptor {
+        /// The provider's display name (e.g. `HelloDb`, `Douban`).
+        name: string,
+        /// The item kinds it offers metadata for (`Movie`, `Series`, …).
+        supported-kinds: list<string>,
+    }
+
+    /// A background task the plugin offers to the scheduled-task registry.
+    record task-descriptor {
+        /// Stable key, unique within this plugin (the host namespaces it).
+        id: string,
+        /// Display name in the dashboard task list.
+        name: string,
+        /// One-line description of what the task does.
+        description: string,
+        /// Dashboard category the task is grouped under.
+        category: string,
+    }
+
+    /// An outbound HTTP request, executed BY THE HOST on the plugin's behalf
+    /// (guests have no sockets). http/https only.
+    record http-request {
+        /// The HTTP method (`GET`, `POST`, …).
+        method: string,
+        /// The absolute http(s) URL.
+        url: string,
+        /// Request headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// Optional request body.
+        body: option<list<u8>>,
+    }
+
+    /// The host-mediated response. Bodies larger than the plugin's memory
+    /// limit are refused (they could never fit in guest memory anyway).
+    record http-response {
+        /// The HTTP status code.
+        status: u16,
+        /// Response headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// The response body bytes.
+        body: list<u8>,
+    }
+
+    /// A read-only library item projection — deliberately small and stable
+    /// (NOT the wire DTO; this is the plugin contract, versioned with the
+    /// world).
+    record item-summary {
+        /// Canonical UUID string of the item.
+        id: string,
+        /// Display name.
+        name: string,
+        /// The item kind (`Movie`, `Episode`, `Series`, `Audio`, …).
+        kind: string,
+        /// Filesystem path, when the item has one.
+        path: option<string>,
+        /// Canonical UUID of the parent item, when there is one.
+        parent-id: option<string>,
+        /// Runtime in ticks (100 ns units), when known.
+        run-time-ticks: option<s64>,
+        /// Genre names.
+        genres: list<string>,
+        /// Premiere/release date, ISO-8601, when known.
+        premiere-date: option<string>,
+        /// When the item entered the library, ISO-8601.
+        date-created: option<string>,
+        /// Community rating on Jellyfin's 0–10 scale.
+        community-rating: option<f64>,
+        /// Release year.
+        production-year: option<s32>,
+        /// Whether the item is a folder/container.
+        is-folder: bool,
+        /// Per-user: whether the user finished the item. Populated only
+        /// when the query carried a `user-id`; `none` otherwise.
+        played: option<bool>,
+        /// Per-user: favorite flag (query `user-id` required, as above).
+        is-favorite: option<bool>,
+        /// Per-user: resume position in ticks (query `user-id` required).
+        playback-position-ticks: option<s64>,
+    }
+
+    /// Filters for `query-items`. Empty/absent fields mean "no filter".
+    record item-query {
+        /// Item kinds to include (`Movie`, `Episode`, …); empty = all kinds.
+        kinds: list<string>,
+        /// Restrict to children of this parent (canonical UUID string).
+        parent-id: option<string>,
+        /// Case-insensitive name search.
+        search-term: option<string>,
+        /// Maximum number of rows (the host caps this at 1000 per call).
+        limit: option<u32>,
+        /// Scope the query to this user (canonical UUID string): enables the
+        /// per-user fields on item-summary, the per-user filters below, and
+        /// the user's parental-rating limits. Typically forwarded from
+        /// `plugin-request.user-id`.
+        user-id: option<string>,
+        /// Per-user filter: only played (`true`) / unplayed (`false`) items.
+        is-played: option<bool>,
+        /// Per-user filter: only (non-)favorites.
+        is-favorite: option<bool>,
+        /// Per-user filter: only items with (without) a resume position.
+        is-resumable: option<bool>,
+        /// Only items carrying ALL of these genres; empty = no filter.
+        genres: list<string>,
+        /// Sort key: `SortName`, `DateCreated`, `DatePlayed`,
+        /// `PremiereDate`, `CommunityRating`, or `Random`. Unset = the
+        /// repository default order.
+        sort-by: option<string>,
+        /// Sort descending (ignored when `sort-by` is unset).
+        sort-descending: bool,
+        /// Fetch exactly these item ids (canonical UUID strings); other
+        /// filters still apply. Empty = no id restriction.
+        ids: list<string>,
+    }
+
+    /// A media segment to persist (`Intro`, `Outro`, `Recap`, `Preview`,
+    /// `Commercial`). Ticks are 100 ns units.
+    record media-segment {
+        /// The segment type name (one of the five above).
+        segment-type: string,
+        /// Segment start, in ticks.
+        start-ticks: s64,
+        /// Segment end, in ticks.
+        end-ticks: s64,
+    }
+
+    /// Metadata a plugin contributes for one item from `metadata-lookup`:
+    /// one remote provider's answer. FOLDED AT THE PROVIDER'S CONFIGURED
+    /// RANK, like any provider's (Jellyfin's `ExecuteRemoteProviders`): the
+    /// scanner runs the item kind's remote providers — the built-in ones and
+    /// every plugin's — one after the other in the library's metadata
+    /// fetcher order (Dashboard → Libraries → Metadata downloaders), then by
+    /// each provider's own default order (a plugin's is 50, Jellyfin's value
+    /// for a provider that declares none), then by registration: plugins
+    /// first, then compiled-in extensions, then the built-in providers (as
+    /// Jellyfin registers its plugins before the server's providers). So a
+    /// plugin the order leaves out runs after the built-in providers that
+    /// declare a lower default order (TheMovieDb for movies, series and
+    /// episodes; OMDb; MusicBrainz; TheAudioDB), but before TheTVDB and
+    /// TheMovieDb's season provider when the order leaves them out too — so
+    /// for seasons a plugin nothing ranks runs first (supported kinds are not
+    /// enforced yet, so this holds for a plugin that does not list Season).
+    /// jellyfin-web lists a fetcher missing from a library's saved order at
+    /// the TOP and saves the order it shows, so a plugin enabled in a library
+    /// saved before it was installed is usually ranked first; a library
+    /// created from the dashboard lists every plugin unticked, as Jellyfin
+    /// does. Local metadata comes first whatever the rank: a provider only
+    /// fills what the item's NFO, embedded book metadata, EXIF or audio tags
+    /// left. The first
+    /// answer to supply a field wins it; a later one fills only what is
+    /// still empty (studios and tags union). So ranked first a plugin's
+    /// values win over the built-in providers'; ranked after them it fills
+    /// their gaps. A plugin reports no answer language, so its overview and
+    /// tagline count as in the library's language: they replace an English
+    /// one an earlier provider supplied (OMDb, TheAudioDB) in a library of
+    /// another language, whatever the rank. The pass's result then merges
+    /// onto the stored item by the refresh mode, as every
+    /// provider's does (a field the user locked is never touched). Image
+    /// contribution is deliberately absent from 0.x (the image pipeline is a
+    /// bigger contract; it lands when a real plugin needs it).
+    record metadata-result {
+        /// Plot/description text.
+        overview: option<string>,
+        /// Release year.
+        production-year: option<s32>,
+        /// Community rating on Jellyfin's 0–10 scale.
+        community-rating: option<f64>,
+        /// Genre names (taken only when no provider ranked above supplied
+        /// any).
+        genres: list<string>,
+        /// External ids to record, as (provider name, id) pairs — e.g. a
+        /// plugin for a niche database records its own id here. An id of a
+        /// name a provider ranked above already answered with stands; the
+        /// providers ranked below are asked by these ids.
+        provider-ids: list<tuple<string, string>>,
+        /// Tagline.
+        tagline: option<string>,
+        /// Studio names (unioned with the other providers').
+        studios: list<string>,
+        /// Tag names (unioned with the other providers').
+        tags: list<string>,
+        /// Parental/official rating, e.g. `PG-13`.
+        official-rating: option<string>,
+        /// End date, ISO-8601 / RFC 3339 (series/albums).
+        end-date: option<string>,
+    }
+}
+
+/// Capabilities Ferrofin grants to every plugin — the ENTIRE effect surface
+/// a guest has on the world. Every function here is host-mediated, logged,
+/// and bounded; adding one is a security decision, not a convenience.
+interface host {
+    use types.{log-level, http-request, http-response, item-summary, item-query, media-segment,
+        media-technical-info, audio-window, audio-chunk, frame-request, video-frame,
+        user-data-update};
+
+    /// Emits a log line into the server's tracing pipeline, tagged with the
+    /// plugin's id and name.
+    log: func(level: log-level, message: string);
+
+    /// Returns the plugin's persisted configuration JSON (the same bytes the
+    /// `/Plugins/{id}/Configuration` API manages). `{}` until the admin
+    /// saves a value; a plugin never sees another plugin's config.
+    get-config: func() -> string;
+
+    /// Performs an outbound HTTP request on the plugin's behalf — the ONLY
+    /// network access a guest has. http/https URLs only; the request runs
+    /// under the plugin's call-timeout budget, destinations are debug-logged,
+    /// and a response body larger than the plugin's memory limit is refused.
+    http-fetch: func(request: http-request) -> result<http-response, string>;
+
+    /// Read-only library queries, as a small stable projection (never the
+    /// full DTO). The host caps `limit` at 1000 rows per call.
+    query-items: func(query: item-query) -> result<list<item-summary>, string>;
+
+    /// Reads THIS plugin's persisted state value for `key` (`none` when
+    /// unset). State is a small local key/value store scoped to the plugin
+    /// — per-user settings, cursors, cache indexes. It is not config: the
+    /// admin never sees or edits it.
+    get-state: func(key: string) -> option<list<u8>>;
+
+    /// Writes (or with `none`, deletes) THIS plugin's state value for
+    /// `key`. Caps: keys ≤ 256 bytes, values ≤ 1 MiB, a plugin's total
+    /// state ≤ 8 MiB by default (the operator can raise it); writes past a
+    /// cap fail with an error. Keys prefixed
+    /// `host:` are RESERVED for the server's own bookkeeping (e.g. the
+    /// analysis watermark) — unreadable and unwritable from a plugin.
+    set-state: func(key: string, value: option<list<u8>>) -> result<_, string>;
+
+    /// The user's next episodes to watch, in order (Jellyfin's NextUp).
+    next-up: func(user-id: string, limit: u32) -> result<list<item-summary>, string>;
+
+    /// The technical facts of one library item (duration, stream kinds).
+    /// Collaborator-armed: refused during plugin load, like `query-items`.
+    media-info: func(item-id: string) -> result<media-technical-info, string>;
+
+    /// Decodes one bounded audio window of a library item to PCM — the
+    /// generic media-analysis primitive (THE HOST DECODES, THE GUEST
+    /// ANALYZES): fingerprinting, loudness, silence detection and anything
+    /// not yet invented are all guest code over these windows. The host
+    /// owns the decoder invocation entirely (no arguments cross this
+    /// boundary beyond the window), runs it under a global analysis
+    /// concurrency budget, and refuses the call during plugin load.
+    extract-audio: func(window: audio-window) -> result<audio-chunk, string>;
+
+    /// Samples bounded still frames of a library item (black-frame,
+    /// scene-cut and similar visual analyses). Same rules as
+    /// `extract-audio`: host-owned pipeline, capped output, load-denied.
+    extract-frames: func(request: frame-request) -> result<list<video-frame>, string>;
+
+    /// Updates a user's watch state for one item (played/favorite/resume).
+    /// TRUST NOTE: this mutates REAL user data for ANY user — the strongest
+    /// write a plugin has (it exists for scrobble-sync plugins like Trakt).
+    /// It is logged per call with the plugin named; install plugins that
+    /// declare it in their documentation and that you trust.
+    set-user-data: func(user-id: string, item-id: string, update: user-data-update) -> result<_, string>;
+
+    /// Saves lyrics for an audio item (replacing existing ones). `format`
+    /// is the lyric file extension (`lrc`, `txt`); content ≤ 2 MiB by
+    /// default (the operator can raise it).
+    write-lyrics: func(item-id: string, format: string, content: list<u8>) -> result<_, string>;
+
+    /// Saves a subtitle file for an item. `language` is a three-letter ISO
+    /// code, `format` the file extension (`srt`, `ass`); content ≤ 2 MiB
+    /// by default (the operator can raise it).
+    write-subtitles: func(item-id: string, language: string, format: string, content: list<u8>) -> result<_, string>;
+
+    /// Creates a collection OWNED BY THIS PLUGIN, seeded with `item-ids`
+    /// (≤ 1000), returning the new collection's id. A plugin can only ever
+    /// modify collections it created (the host keeps the ownership ledger).
+    create-collection: func(name: string, item-ids: list<string>) -> result<string, string>;
+
+    /// Adds/removes items (≤ 1000 each) on a collection THIS PLUGIN owns.
+    update-collection: func(collection-id: string, add: list<string>, remove: list<string>) -> result<_, string>;
+
+    /// Extracts one embedded subtitle stream of a library item as SRT
+    /// bytes (≤ 10 MiB by default; operator-tunable). `stream-index` is
+    /// the SUBTITLE-relative index
+    /// (0 = first subtitle stream). Same rules as the other extraction
+    /// fns: host-owned pipeline, item-addressed, load-denied.
+    extract-subtitle-track: func(item-id: string, stream-index: u32) -> result<list<u8>, string>;
+
+    /// Replaces THIS plugin's media segments for an item (other providers'
+    /// and user-authored segments are untouched — each plugin writes under
+    /// its own provider id, like every segment provider). An empty list
+    /// erases the plugin's segments for the item.
+    write-media-segments: func(item-id: string, segments: list<media-segment>) -> result<_, string>;
+}
+
+/// The contract a Ferrofin plugin component implements.
+world plugin {
+    use types.{plugin-descriptor, config-page, task-descriptor, item-summary, metadata-result, plugin-request, plugin-response, web-transform, provider-descriptor, image-candidate};
+
+    import host;
+
+    /// The plugin's identity; called once at load, before anything else.
+    export descriptor: func() -> plugin-descriptor;
+
+    /// The seed configuration JSON written on first run.
+    export default-config: func() -> string;
+
+    /// The dashboard settings pages this plugin ships (may be empty — the
+    /// host then synthesizes a generic JSON editor over the plugin's
+    /// config, so every plugin stays configurable from the dashboard).
+    /// Called once at load; network-mute like the other identity exports.
+    export config-pages: func() -> list<config-page>;
+
+    /// The plugin's PUBLIC-EGRESS ALLOWLIST — every internet destination
+    /// its `http-fetch` may ever contact, declared in the artifact itself
+    /// so anyone can audit a plugin's reach before installing (the same
+    /// values live in the plugin repo's Cargo.toml, in plain sight).
+    ///
+    /// Entries: an exact host (`api.themoviedb.org`), a subdomain wildcard
+    /// (`*.fanart.tv`), an IP literal, or `*` (ANY public host — for
+    /// plugins whose destinations are user-configured, e.g. webhooks; the
+    /// host logs a loud warning for `*` plugins at load). DENY BY DEFAULT:
+    /// an empty list means this plugin has no public network reach at all.
+    ///
+    /// The check runs on the URL's host string BEFORE any DNS resolution
+    /// (a denied fetch must not leak data through the DNS query itself).
+    /// Private/LAN destinations are a separate, admin-granted layer and
+    /// are not granted by this list.
+    export declared-egress: func() -> list<string>;
+
+    /// The web-file transformations this plugin declares (may be empty).
+    /// Called once at load; applied by the host to served `/web` files
+    /// while the plugin is enabled. See the `web-transform` trust note.
+    export web-transforms: func() -> list<web-transform>;
+
+    /// Handles one HTTP request from the plugin's own URL space
+    /// (`/Plugins/{id}/web/…`). A plugin that serves no routes returns
+    /// `404` unconditionally. See the `plugin-request` trust note: this
+    /// runs for UNAUTHENTICATED callers too.
+    export handle-request: func(request: plugin-request) -> plugin-response;
+
+    /// This plugin's identity as a NAMED metadata provider, when it is
+    /// one (`none` for everyone else — the common case). A named provider
+    /// appears in the dashboard's library-options fetcher lists for its
+    /// supported kinds, under its `name`: the admin ticks it per library and
+    /// ranks it among the built-in providers, and `metadata-lookup` runs at
+    /// that rank (see `metadata-result`). A plugin without one is in no
+    /// list: it is asked about every item, ranked like a provider the admin
+    /// left out of the order.
+    export provider-info: func() -> option<provider-descriptor>;
+
+    /// Remote-artwork candidates for one item (empty for non-providers).
+    /// Called during the scan for items still missing artwork after the
+    /// built-in providers ran; the host downloads the first suitable
+    /// candidate per missing slot through the plugin's declared egress.
+    export remote-images: func(item: item-summary) -> result<list<image-candidate>, string>;
+
+    /// The item kinds this plugin ANALYZES (`Movie`, `Episode`, `Audio`,
+    /// …). Empty — the common case — means the plugin is not an analyzer
+    /// and `scan-media` is never called. Identity export: read once at
+    /// load, network-mute.
+    export scan-targets: func() -> list<string>;
+
+    /// Offered one eligible library item by the host's analysis pass
+    /// (each new item is offered once per plugin, host-tracked). The guest
+    /// pulls data with `media-info`/`extract-audio`/`extract-frames` and
+    /// persists results through its existing capabilities
+    /// (`write-media-segments`, `set-state`). An orderly error is logged
+    /// (aggregated per pass) and the item is not retried; TRAPS — not
+    /// orderly errors — count toward the plugin's breaker. A failing
+    /// plugin NEVER fails the scan.
+    export scan-media: func(item: item-summary) -> result<_, string>;
+
+    /// The background tasks this plugin contributes (may be empty).
+    export tasks: func() -> list<task-descriptor>;
+
+    /// Runs one of the plugin's tasks to completion. `task-id` is the
+    /// `task-descriptor.id` the plugin advertised. An `err` return is
+    /// recorded as a failed task run.
+    export run-task: func(task-id: string) -> result<_, string>;
+
+    /// Delivers one domain event. `event-name` is the server's stable event
+    /// type name (`LibraryChanged`, `PlaybackStart`, …); `event-json` is its
+    /// serialized payload. Called only while the plugin is enabled; a slow
+    /// consumer loses oldest events rather than slowing the server.
+    export on-event: func(event-name: string, event-json: string);
+
+    /// Offers metadata for one library item when the library scanner
+    /// refreshes it, as one of the item kind's remote providers, at this
+    /// plugin's rank among them
+    /// (see `metadata-result`). `item` identifies the item (id, name, kind,
+    /// path); `provider-ids` are the item's known external ids plus every id
+    /// a provider ranked above this one answered with in the same pass.
+    /// Return `none` when this plugin has nothing to offer (the common case
+    /// — a plugin that is not a metadata source returns `none`
+    /// unconditionally). An `err` counts as a provider failure, as a
+    /// built-in provider's failed request does: the item's refresh is not
+    /// recorded as complete, so the next scan asks again.
+    export metadata-lookup: func(item: item-summary, provider-ids: list<tuple<string, string>>) -> result<option<metadata-result>, string>;
+}

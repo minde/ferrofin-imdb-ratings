@@ -1,0 +1,43 @@
+# Ferrofin plugin — build config.
+#
+# Build:  ./build.sh   (or:  cargo build --release --target wasm32-wasip2)
+# Output: dist/imdb_ratings.wasm  →  drop into {ferrofin_data_dir}/plugins/, restart
+# Tests:  ./test.sh    (runs the dataset parser on the host target)
+[package]
+name = "imdb-ratings"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shows IMDb ratings on movie and series cards and detail pages."
+publish = false
+
+# Identity — the single source of truth. Read by build.rs, which feeds
+# descriptor() in src/lib.rs, so the runtime id never drifts.
+[package.metadata.ferrofin]
+guid = "a09dc592-316a-484e-970d-0d8fcc196ab5"
+name = "IMDb Ratings"
+description = "Shows IMDb ratings on movie and series cards and detail pages."
+owner = "minde"
+category = "General"
+# Public network reach, enforced by the server: IMDb's daily ratings dataset.
+egress = ["datasets.imdbws.com"]
+
+# A WASM component is a standalone artifact, not part of a Cargo workspace.
+[workspace]
+
+[lib]
+# cdylib becomes the .wasm; rlib lets `cargo test` link the parser natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+# Pure-Rust gzip (miniz_oxide); nothing native to link into the component.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# Speed over size: a refresh parses ~1.6M rows inside one 30 s guest call.
+opt-level = 3
+lto = true
+strip = true

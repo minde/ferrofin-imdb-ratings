@@ -1,0 +1,78 @@
+# Release — cuts a versioned GitHub Release with the built .wasm attached and
+# republishes the plugin-repository manifest to GitHub Pages, automatically,
+# whenever the version in Cargo.toml changes on `main`.
+#
+# The workflow: bump `version` in Cargo.toml (semver MAJOR.MINOR.PATCH) and
+# merge to main. This job reads that version; if no `vX.Y.Z` release exists
+# yet, it builds the plugin, publishes the release (creating the tag), then
+# regenerates site/manifest.json from ALL releases and deploys it to the
+# gh-pages branch. Admins add the plugin to Ferrofin with:
+#   https://<owner>.github.io/<repo>/manifest.json
+# (Enable Pages once: Settings → Pages → deploy from branch → gh-pages.)
+#
+# Actions are pinned by commit SHA: this workflow computes the checksums the
+# server verifies, so it is part of the trust chain — a mutable tag is not.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0   # tags decide whether this version is already released
+
+      # Read the semver version from Cargo.toml → v<version>.
+      - id: ver
+        run: |
+          v="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Cargo.toml version '$v' is not semver MAJOR.MINOR.PATCH"; exit 1
+          fi
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+
+      - id: check
+        run: |
+          if git rev-parse "refs/tags/${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "${{ steps.ver.outputs.tag }} already released — refreshing the manifest only"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No toolchain action needed: the runner's rustup reads
+      # rust-toolchain.toml and auto-installs the pinned channel + the
+      # wasm32-wasip2 target on the first cargo invocation.
+      - if: steps.check.outputs.new == 'true'
+        run: ./test.sh
+      - if: steps.check.outputs.new == 'true'
+        run: ./build.sh
+
+      # Publish the release. The asset keeps a CONSTANT name (your crate
+      # name), so pinned + latest download URLs stay stable.
+      - if: steps.check.outputs.new == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*.wasm
+
+      # Regenerate the repository manifest from ALL releases (runs on every
+      # main push, so a manually-created release also gets picked up).
+      - run: ./scripts/gen-manifest.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          # keep_files: false (default) — the manifest is regenerated whole.

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "IMDb Ratings",
+    "description": "Shows IMDb ratings on movie and series cards and detail pages.",
+    "overview": "Shows IMDb ratings on movie and series cards and detail pages.",
+    "owner": "minde",
+    "category": "General",
+    "guid": "a09dc592-316a-484e-970d-0d8fcc196ab5",
+    "versions": [
+      {
+        "version": "0.1.0",
+        "targetAbi": "ferrofin:plugin@0.5.0",
+        "sourceUrl": "https://github.com/minde/ferrofin-imdb-ratings/releases/download/v0.1.0/imdb_ratings.wasm",
+        "checksum": "06ef982eb84347274874bb798967bd9f",
+        "sha256": "3e3745440a9b40fa85dad74fb5e884a19b2fe9a4c74c2fe64d6b5cb4f15c4f84",
+        "timestamp": "2026-10-23T09:08:10Z",
+        "repositoryName": "minde/ferrofin-imdb-ratings",
+        "repositoryUrl": "https://github.com/minde/ferrofin-imdb-ratings"
+      }
+    ]
+  }
+]

@@ -31,7 +31,7 @@ egress = ["datasets.imdbws.com"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wit-bindgen = "0.60"
+wit-bindgen = "0.63"
 # Pure-Rust gzip (miniz_oxide); nothing native to link into the component.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde = { version = "1", features = ["derive"] }

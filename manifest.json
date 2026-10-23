@@ -1,8 +1,8 @@
 [
   {
     "name": "IMDb Ratings",
-    "description": "Shows IMDb ratings on movie and series cards and detail pages.",
-    "overview": "Shows IMDb ratings on movie and series cards and detail pages.",
+    "description": "IMDb ratings on movie and TV show cards and pages in the Jellyfin web client, for Ferrofin (Jellyfin in Rust).",
+    "overview": "IMDb ratings on movie and TV show cards and pages in the Jellyfin web client, for Ferrofin (Jellyfin in Rust).",
     "owner": "minde",
     "category": "General",
     "guid": "a09dc592-316a-484e-970d-0d8fcc196ab5",

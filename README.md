@@ -6,10 +6,9 @@ ratings in the web client:
 - on movie and series cards, after the year
 - on movie and series pages, next to the community and critic ratings
 
-<p>
-  <img src="docs/card.png" alt="A series card reading 2008 - 2013 · IMDb 9.5" height="300">
-  <img src="docs/detail-page.png" alt="A series page with ratings ★ 9.0, 🍅 96 and IMDb 9.5" width="600">
-</p>
+![A movie library where every card reads the year, then the IMDb rating, e.g. "2010 · IMDb 7.5"](docs/movies-grid.png)
+
+![The Velvet Hours movie page: 2024, 1h 55m, R, ★ 5.7, 🍅 76, IMDb 5.7, Ends at 13:53](docs/movie-detail.png)
 
 Hover a rating to see its vote count. Titles with no IMDb rating show nothing.
 No API key, no configuration.

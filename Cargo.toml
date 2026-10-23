@@ -8,7 +8,7 @@ name = "imdb-ratings"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Shows IMDb ratings on movie and series cards and detail pages."
+description = "IMDb ratings on movie and TV show cards and pages in the Jellyfin web client, for Ferrofin (Jellyfin in Rust)."
 repository = "https://github.com/minde/ferrofin-imdb-ratings"
 publish = false
 
@@ -17,7 +17,7 @@ publish = false
 [package.metadata.ferrofin]
 guid = "a09dc592-316a-484e-970d-0d8fcc196ab5"
 name = "IMDb Ratings"
-description = "Shows IMDb ratings on movie and series cards and detail pages."
+description = "IMDb ratings on movie and TV show cards and pages in the Jellyfin web client, for Ferrofin (Jellyfin in Rust)."
 owner = "minde"
 category = "General"
 # Public network reach, enforced by the server: IMDb's daily ratings dataset.

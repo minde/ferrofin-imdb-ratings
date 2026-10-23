@@ -1,10 +1,16 @@
-# IMDb Ratings for Ferrofin
+# IMDb Ratings for Ferrofin (Jellyfin in Rust)
 
-A [Ferrofin](https://github.com/mangoleaf/ferrofin) plugin that shows IMDb
-ratings in the web client:
+Show **IMDb ratings** for your movies and TV shows in the Jellyfin web client,
+on [Ferrofin](https://github.com/mangoleaf/ferrofin), the Rust port of the
+Jellyfin media server.
 
-- on movie and series cards, after the year
-- on movie and series pages, next to the community and critic ratings
+Ferrofin is a drop-in reimplementation of Jellyfin in Rust: same API, same
+web client and apps, and it can take over an existing Jellyfin database. This
+plugin adds the IMDb score:
+
+- on movie and TV show cards in your library, after the year
+- on movie and TV show pages, next to the community rating and the critic
+  (Rotten Tomatoes) score
 
 ![A movie library where every card reads the year, then the IMDb rating, e.g. "2010 · IMDb 7.5"](docs/movies-grid.png)
 
@@ -92,6 +98,23 @@ Bump `version` in `Cargo.toml`, add an entry to [CHANGELOG.md](CHANGELOG.md),
 and push to `main`. The release workflow tests, builds and publishes a
 `vX.Y.Z` GitHub Release, then regenerates the repository manifest on GitHub
 Pages.
+
+## FAQ
+
+**Does it work on Jellyfin itself?** No. Jellyfin loads .NET plugins;
+Ferrofin, the Rust port of Jellyfin, loads sandboxed WebAssembly plugins, and
+this is one of those. If you run Jellyfin, you'd need Ferrofin to use it.
+
+**Do I need an IMDb or OMDb API key?** No. It uses IMDb's free public
+ratings dataset.
+
+**Why does a title show no IMDb rating?** It has no IMDb id in its metadata,
+IMDb has no rating for it yet, or it was matched to the wrong title. Check
+its metadata.
+
+**Does it change my library's metadata?** No. It only displays ratings. The
+community rating and critic score your metadata providers supply stay as
+they are.
 
 ## License
 

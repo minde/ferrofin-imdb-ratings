@@ -45,6 +45,10 @@ releases="$(gh release list --repo "$REPO" --json tagName,publishedAt \
               -q '.[] | [.tagName, .publishedAt] | @tsv')" \
   || { echo "gh release list failed — refusing to publish an empty manifest" >&2; exit 1; }
 
+# The release step creates its tag on GitHub after the checkout, so fetch
+# tags before reading each release's WIT below.
+git fetch --quiet --tags origin 2>/dev/null || true
+
 mkdir -p site
 versions='[]'
 while IFS=$'\t' read -r tag published; do
@@ -64,7 +68,8 @@ while IFS=$'\t' read -r tag published; do
   # at the release's tag, not the working tree's (older releases must not be
   # relabelled with a newer world version). Falls back to the current WIT
   # only for a tag whose tree predates the vendored contract.
-  abi="$(git show "$tag:wit/ferrofin-plugin.wit" 2>/dev/null \
+  # (`|| true`: under pipefail a missing tag would otherwise abort the script.)
+  abi="$({ git show "$tag:wit/ferrofin-plugin.wit" 2>/dev/null || true; } \
     | sed -n 's/^package \(ferrofin:plugin@[0-9.]*\);$/\1/p')"
   [ -n "$abi" ] || abi="$TARGET_ABI"
   versions="$(jq -c \
